@@ -46,14 +46,22 @@ def get_chains(q):
             if m: tag = m.group(1).split('|')[0]
         if not tag:
             cl = (content or '').lower()
-            # Example domain rules — customize for your projects
-            # Add your own patterns here, e.g.:
-            # rules = [
-            #     (r'tax|finance|accounting', 'finance'),
-            #     (r'frontend|react|css', 'frontend'),
-            # ]
-            pass
-        if not tag: tag = 'general' 
+            rules = [
+                (r'\btax\b|LHDN|EPF|SOCSO|PnL|audit|profit|expense\b|deduction', 'tax-finance'),
+                (r'parakeet|nemo|fine.?tun|WER\b|ASR|onnx|int8|torch.*2\.6|cuda\b|vastai|GPU', 'parakeet-asr'),
+                (r'\bpos\b|nasi.*campur|restaurant|menu|customer|cashier|bungkus', 'nasi-campur-pos'),
+                (r'deepseek|claude.*code|opencode\b|mcp|api.*key|anthropic|ai.memory|memory.system', 'ai-tools'),
+                (r'memory|fts5|index|sqlite|recall|search\b|timeline', 'memory-system'),
+                (r'handy|tailscale|websocket|server\b|tls|cert|port.*8\d{3}', 'stt-server'),
+            ]
+            for pat, t in rules:
+                if re.search(pat, cl): tag = t; break
+        if not tag:
+            tl = (title or '').lower()
+            if 'tax' in tl or 'LHDN' in tl: tag = 'tax-finance'
+            elif 'parakeet' in tl or 'nemo' in tl: tag = 'parakeet-asr'
+            elif 'pos' in tl or 'restaurant' in tl: tag = 'nasi-campur-pos'
+        if not tag: tag = 'other' 
         
         # Extract facts: data-rich lines OR keyword-matched conceptual lines
         lines = [l.strip() for l in content.split(chr(10)) if len(l.strip()) > 25]
@@ -121,6 +129,34 @@ def search_docs(q):
         return chr(10).join("- %s" % f for _, f in scored[:5]) if scored else ""
     except: return ""
 
+def graph_context(q):
+    """Find related entities from the conversation graph."""
+    graph_path = os.path.expanduser("~/Projects/conv-graph/graph.json")
+    if not os.path.exists(graph_path): return ""
+    try:
+        with open(graph_path) as f: g = json.load(f)
+    except: return ""
+    terms = set(re.findall(r'\w+', q.lower())) - STOP
+    nodes = {n["id"]: n for n in g["nodes"]}
+    matches = []
+    for name, data in nodes.items():
+        score = sum(1 for t in terms if t in name)
+        if score > 0:
+            # Find top connected entities
+            top = []
+            for e in g["edges"]:
+                if e["source"] == name: top.append((e["target"], e["weight"]))
+                elif e["target"] == name: top.append((e["source"], e["weight"]))
+            top.sort(key=lambda x: x[1], reverse=True)
+            top_str = ", ".join(f"{t} ({w})" for t, w in top[:4])
+            matches.append((score, name, data["type"], data["weight"], top_str))
+    if not matches: return ""
+    matches.sort(key=lambda x: (x[0], x[3]), reverse=True)
+    lines = ["## 🔗 Graph"]
+    for score, name, etype, weight, top_str in matches[:3]:
+        lines.append(f"- **{name}** ({etype}, {weight}×): {top_str}")
+    return "\n".join(lines) + "\n"
+
 def search(q):
     qq = q.lower().strip()
     q_words = set(re.findall(r'\w+', qq))
@@ -142,10 +178,12 @@ def search(q):
     
     chains = get_chains(qq)
     docs = search_docs(doc_q)
+    graph_ctx = graph_context(qq)
     parts = []
     if chains: parts.append(chains)
     if docs: parts.append("## 📂 Documents\n" + docs)
-    result = "\n".join(parts)[:1500] if parts else "Nothing found."
+    if graph_ctx: parts.append(graph_ctx)
+    result = "\n".join(parts)[:2500] if parts else "Nothing found."
     
     if result != "Nothing found.":
         try:
