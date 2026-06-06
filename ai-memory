@@ -1,0 +1,243 @@
+#!/usr/bin/env python3.14
+"""AI Memory — returns answers, not file paths."""
+import sqlite3, sys, os, re, time
+
+DB = os.path.expanduser("~/.ai-log/sessions.db")
+
+QUESTION_PATTERNS = [
+    r'\b(?:can|should|could|would|will|do|does|did|is|are|was|were|has|have)\s+(?:I|we|you|they)\s+',
+    r'\b(?:what|how|where|when|who|why)\s+(?:is|are|was|were|do|does|did|can|could|should|would|will|has|have)\s+(?:I|we|you|they)\s+',
+    r'\babout\s+(?:our|my|the)\s+',
+    r'\b(?:i\s+(?:was|am)\s+(?:thinking|wondering|trying)|i\s+(?:want|need|wanna|gonna)\s+(?:to|a)\s+)',
+    r'\b(?:maybe|perhaps)\s+(?:we|I|you|they)\s+',
+    r'\b(?:is there|are there)\s+(?:a|any|some)\s+',
+    r'\b(?:help|tell)\s+(?:me|us)\s+(?:about|with|to|how)\s+',
+    r'\b(?:find|search|look\s+up|look\s+for|locate)\s+(?:me|my|the|a|some)\s+',
+]
+
+FILLER_PATTERNS = [
+    r'\bto\s+look\s+for\s+what\s+(?:I|we)\s+want\b',
+    r'\bto\s+find\s+(?:out\s+)?what\s+(?:I|we)\s+(?:want|need)\b',
+    r'\band\s+then\s+(?:spit|give|return|send|pass)\s+(?:answer|result|it)\s+to\b',
+    r'\b(?:spit|give|return|send|pass)\s+(?:answer|result|it)\s+to\s+(?:agent|me|us)\b',
+    r'\bto\s+remove\s+the\b',
+    r'\bto\s+fix\s+(?:the|this|that|our|my)\b',
+    r'\bto\s+make\s+(?:it|this|that|things)\s+(?:faster|better|work)\b',
+    r'\bcan\s+(?:you|we|I|someone)\s+(?:help|assist|explain|tell)\s+(?:me|us)?\b',
+    r'\b(?:I|we)\s+(?:need|want)\s+(?:to|a)\s+(?:know|understand|find|get|see|have)\b',
+    r'\bwhat\s+(?:do|did|does)\s+(?:you|we|I|they)\s+think\b',
+    r'\bhow\s+(?:do|did|does|can|could|would|should)\s+(?:I|we|you)\s+',
+]
+
+def rewrite_query(q):
+    qq = ' ' + q.lower().strip() + ' '
+    for pat in QUESTION_PATTERNS:
+        qq = re.sub(pat, ' ', qq)
+    for pat in FILLER_PATTERNS:
+        qq = re.sub(pat, ' ', qq)
+    qq = re.sub(r'[?.,!;:]+', ' ', qq)
+    qq = re.sub(r'\s+', ' ', qq).strip()
+    return qq
+
+def tokenize(q):
+    compounds = re.findall(r'[\w]+-[\w]+(?:-[\w]+)*', q)
+    units = re.findall(r'\d+[smhdw]\b', q)
+    words = re.findall(r'[a-z0-9]{2,}', q)
+    seen = set()
+    terms = []
+    for t in compounds + units:
+        if t not in seen:
+            seen.add(t)
+            terms.append(t)
+    for w in words:
+        if w not in seen and len(w) >= 2:
+            seen.add(w)
+            terms.append(w)
+    return terms
+
+def term_weight(t):
+    """Compounds = very specific. Long words = specific. Short/digit = common."""
+    if '-' in t or '_' in t:
+        return 5.0
+    if re.search(r'\d', t):
+        return 1.0           # "30s", "100MB" — too common to anchor
+    if len(t) <= 3:
+        return 0.1
+    if len(t) <= 5:
+        return 1.0
+    if len(t) <= 7:
+        return 2.0
+    return 3.0                # 8+ chars = anchor-worthy
+
+def topic_terms(query_terms):
+    """Return the best topic-defining terms (only compound terms like 'ai-memory')."""
+    topics = [t for t in query_terms if term_weight(t) >= 5.0]
+    if not topics:
+        topics = [t for t in query_terms if term_weight(t) >= 3.0]
+    return topics[:2]
+
+def search(q, limit=5):
+    db = sqlite3.connect(DB)
+    cleaned = rewrite_query(q)
+    query_terms = tokenize(cleaned)
+    if not query_terms:
+        query_terms = tokenize(q.lower())
+
+    topics = topic_terms(query_terms)
+    candidates = []
+
+    # Build FTS5 query: require topic terms (AND), bonus terms (OR)
+    # Stage 1: require at least one topic term via instr()
+    # Stage 2: use FTS5 for full-text relevance
+    topic_sql = ""
+    topic_params = []
+    if topics:
+        clauses = ' OR '.join(['instr(lower(s.content), ?) > 0' for _ in topics])
+        topic_sql = f" AND ({clauses})"
+        topic_params = topics
+
+    # FTS5 query: all terms OR'd for ranking signal
+    escaped = []
+    for t in query_terms[:10]:
+        safe = t.replace('"', '').replace("'", '')
+        if safe:
+            escaped.append(f'"{safe}"')
+    fts_q = ' OR '.join(escaped) if escaped else None
+
+    if fts_q:
+        try:
+            pool = db.execute(f"""
+                SELECT s.id, s.source, s.title, s.timestamp, s.path, rank
+                FROM sessions_fts f JOIN sessions s ON s.id = f.rowid
+                WHERE sessions_fts MATCH ?{topic_sql}
+                ORDER BY rank LIMIT 30
+            """, [fts_q] + topic_params).fetchall()
+        except:
+            pool = []
+    else:
+        pool = []
+
+    if not pool and topics:
+        # Fallback: search with just topic terms, no FTS5
+        like_clauses = ' OR '.join(['s.title LIKE ? OR s.content LIKE ?' for _ in topics])
+        params = []
+        for t in topics:
+            params.extend([f'%{t}%', f'%{t}%'])
+        pool = db.execute(f"""
+            SELECT s.id, s.source, s.title, s.timestamp, s.path, 0.0 as rank
+            FROM sessions s WHERE {like_clauses}
+            ORDER BY s.timestamp DESC LIMIT {limit}
+        """, params).fetchall()
+
+    if pool:
+        for sid, src, title, ts, path, bm25 in pool:
+            score = abs(bm25) if bm25 and bm25 != 0 else 1.0
+            candidates.append((score, sid, src, title, ts, path))
+    else:
+        # Last resort: recent sessions
+        for sid, src, title, ts, path in db.execute("""
+            SELECT s.id, s.source, s.title, s.timestamp, s.path
+            FROM sessions s ORDER BY s.timestamp DESC LIMIT 5
+        """).fetchall():
+            candidates.append((0.0, sid, src, title, ts, path))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    top_ids = [c[1] for c in candidates[:limit]]
+
+    if top_ids:
+        ph = ','.join('?' for _ in top_ids)
+        content_rows = dict(db.execute(
+            f"SELECT id, content FROM sessions WHERE id IN ({ph})", top_ids
+        ).fetchall())
+    else:
+        content_rows = {}
+
+    db.close()
+
+    results = []
+    for score, sid, src, title, ts, path in candidates[:limit]:
+        results.append((src, title, ts, path, content_rows.get(sid, ""), score))
+    return results
+
+def extract_relevant(content, query, max_chars=1500):
+    """Extract human-readable passages. Skips JSON structure, log noise."""
+    if not content:
+        return ""
+    lines = content.split('\n')
+    query_terms = set(re.findall(r'\w+', query.lower()))
+
+    scored = []
+    for line in lines:
+        line_clean = line.strip()
+        if len(line_clean) < 15:
+            continue
+        # Skip JSON structure lines
+        if re.match(r'^[\s]*["{}\[\]]', line_clean):
+            continue
+        if re.match(r'^[\s]*"(\w+)":\s*["{\[]', line_clean):
+            continue
+        # Skip machine noise
+        if re.match(r'^\d{10,}\|', line_clean):
+            continue
+        if re.match(r'^prt_[a-zA-Z0-9]+\|', line_clean):
+            continue
+        if re.match(r'^msg_[a-zA-Z0-9]+[\|\s]', line_clean):
+            continue
+        # Skip log/trace lines
+        if re.match(r'^\[\d{4}-\d{2}-\d{2}', line_clean):
+            continue
+        if 'service=llm' in line_clean or 'service=tui' in line_clean:
+            continue
+
+        line_terms = set(re.findall(r'\w+', line_clean.lower()))
+        score = len(query_terms & line_terms)
+        if score > 0:
+            scored.append((score, line_clean))
+
+    scored.sort(reverse=True)
+    seen = set()
+    result = []
+    for _, line in scored:
+        key = line[:80]
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(line)
+        if sum(len(r) for r in result) > max_chars:
+            break
+
+    return '\n'.join(result) if result else ""
+
+def main():
+    t0 = time.time()
+    if len(sys.argv) < 2:
+        print("Usage: ai-memory <question>")
+        sys.exit(1)
+
+    q = " ".join(sys.argv[1:])
+    cleaned = rewrite_query(q)
+    rows = search(q)
+    elapsed = (time.time() - t0) * 1000
+
+    if not rows:
+        print(f"Nothing found. Searched for: {cleaned}")
+        return
+
+    shown = 0
+    for src, title, ts, path, content, score in rows:
+        relevant = extract_relevant(content or "", cleaned)
+        if not relevant:
+            continue
+        shown += 1
+        print(f"\n## {title}")
+        print(f"   {src} | {ts or '?'} | score={score:.1f}")
+        print(f"   {relevant}")
+        print()
+
+    if shown == 0:
+        print(f"No readable content found for: {cleaned}")
+    else:
+        print(f"({elapsed:.0f}ms, {shown} results)")
+
+if __name__ == "__main__":
+    main()
